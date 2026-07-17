@@ -6,6 +6,17 @@ gezinme, breadcrumb, ızgara/liste görünümü, Genel/İzinler/Paylaşım sekme
 özellik paneli, Git durumu paneli, dosya önizlemesi, gömülü terminal (VTE),
 hızlı işlemler ve son kullanılanlar paneli içerir.
 
+Ayrıca: arka planda (UI'yi dondurmadan) kopyala/taşı/sil işlemleri —
+ilerleme çubuğu, iptal ve çakışma çözümü (atla/değiştir/yeniden adlandır)
+ile; **Geri Al / Yinele** (Ctrl+Z / Ctrl+Shift+Z); gerçek **Çöp Kutusu**
+gezinme, geri yükleme ve kalıcı silme (GVFS gerektirmez); gizli dosya
+göster/gizle (Ctrl+H); adres çubuğuna yazarak gitme (Ctrl+L); çoklu seçimde
+toplam boyut/sayı özeti; arşiv **sıkıştır/çıkart** (zip/tar, zip-slip
+korumalı); çalıştırılabilir dosyalarda çalıştır/düzenle onayı; ızgara
+görünümünde gerçek resim küçük resimleri; USB gibi çıkarılabilir diskler
+için bağla/çıkar; `smb://`, `sftp://`, `ftp://` ağ konumlarına bağlanma;
+ve Tercihler / Hakkında penceresi.
+
 ## Kurulum
 
 ```bash

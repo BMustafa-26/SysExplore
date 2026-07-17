@@ -1,12 +1,13 @@
 """Central file listing widget: grid (icon) view and list (detail) view."""
 import os
+import threading
 
 import gi
 
 gi.require_version("Gtk", "3.0")
 from gi.repository import Gdk, GdkPixbuf, GLib, GObject, Gtk  # noqa: E402
 
-from sysdev_explorer import fileops, icons
+from sysdev_explorer import clipboard, fileops, icons, operations
 from sysdev_explorer.disk_utils import human_size
 
 COL_NAME, COL_PATH, COL_PIXBUF, COL_MARKUP, COL_IS_DIR, COL_SIZE, COL_MTIME, COL_TYPE = range(8)
@@ -24,19 +25,23 @@ class FileView(Gtk.Box):
         "file-opened": (GObject.SignalFlags.RUN_FIRST, None, (str,)),
     }
 
-    def __init__(self, clipboard_state, start_path):
+    def __init__(self, window, start_path):
         super().__init__(orientation=Gtk.Orientation.VERTICAL)
-        self.clipboard_state = clipboard_state
+        self.window = window
         self.current_path = start_path
         self.history = [start_path]
         self.history_index = 0
         self._search_text = ""
+        self._load_generation = 0
+        self.is_trash = False
+        self.show_hidden = window.preferences.get("show_hidden") if window else False
 
         self.store = Gtk.ListStore(str, str, GdkPixbuf.Pixbuf, str, bool, GObject.TYPE_INT64, float, str)
         self.filter_model = self.store.filter_new()
         self.filter_model.set_visible_func(self._filter_func)
 
         self.icon_view = Gtk.IconView(model=self.filter_model)
+        self.icon_view.set_selection_mode(Gtk.SelectionMode.MULTIPLE)
         self.icon_view.set_pixbuf_column(COL_PIXBUF)
         self.icon_view.set_markup_column(COL_MARKUP)
         self.icon_view.set_item_width(110)
@@ -59,7 +64,8 @@ class FileView(Gtk.Box):
         self.stack = Gtk.Stack()
         self.stack.add_named(self._wrap_scroller(self.icon_view), "grid")
         self.stack.add_named(self._wrap_scroller(self.tree_view), "list")
-        self.stack.set_visible_child_name("grid")
+        default_mode = window.preferences.get("view_mode") if window else "grid"
+        self.stack.set_visible_child_name(default_mode if default_mode in ("grid", "list") else "grid")
         self.pack_start(self.stack, True, True, 0)
 
         self._enable_drag_and_drop()
@@ -109,19 +115,26 @@ class FileView(Gtk.Box):
 
     def _render_mtime(self, _col, cell, model, tree_iter, _data=None):
         mtime = model.get_value(tree_iter, COL_MTIME)
-        cell.set_property("text", fileops.format_mtime(mtime))
+        cell.set_property("text", fileops.format_mtime(mtime) if mtime else "-")
 
     # -- loading -----------------------------------------------------------
     def refresh(self):
         self.load_directory(self.current_path, push_history=False)
 
     def load_directory(self, path, push_history=True):
-        if path.startswith("trash://") or path.startswith("network://"):
-            self.store.clear()
-            self.emit("status-changed", "Bu konum henüz desteklenmiyor")
-            self.current_path = path
-            self.emit("path-changed", path)
+        self._load_generation += 1
+        if path == "trash:///":
+            self._load_trash()
+            self._finish_load(path, push_history, status_override=None)
             return
+        if path.startswith("network://"):
+            self.store.clear()
+            self.is_trash = False
+            self.emit("status-changed", "Ağ konumları henüz yalnızca 'Bağlan...' ile desteklenir")
+            self._finish_load(path, push_history, status_override="")
+            return
+
+        self.is_trash = False
         try:
             entries = list(os.scandir(path))
         except OSError as exc:
@@ -131,8 +144,7 @@ class FileView(Gtk.Box):
         self.store.clear()
         entries.sort(key=lambda e: (not e.is_dir(follow_symlinks=True), e.name.lower()))
 
-        n_dirs = n_files = 0
-        total_size = 0
+        image_candidates = []
         for entry in entries:
             try:
                 st = entry.stat(follow_symlinks=False)
@@ -141,7 +153,6 @@ class FileView(Gtk.Box):
             is_dir = entry.is_dir(follow_symlinks=True)
             pixbuf = icons.pixbuf_for_path(entry.path, size=48)
             if is_dir:
-                n_dirs += 1
                 try:
                     n_children = len(os.listdir(entry.path))
                 except OSError:
@@ -150,11 +161,11 @@ class FileView(Gtk.Box):
                 type_label = "Klasör"
                 size_bytes = 0
             else:
-                n_files += 1
-                total_size += st.st_size
                 subtitle = human_size(st.st_size)
                 type_label = fileops.guess_type_label(entry.path)
                 size_bytes = st.st_size
+                if type_label.startswith("image/"):
+                    image_candidates.append(entry.path)
 
             name = GLib.markup_escape_text(entry.name)
             markup = f"{name}\n<small>{GLib.markup_escape_text(subtitle)}</small>"
@@ -162,14 +173,118 @@ class FileView(Gtk.Box):
                 entry.name, entry.path, pixbuf, markup, is_dir, size_bytes, st.st_mtime, type_label,
             ])
 
+        self._finish_load(path, push_history)
+        if image_candidates:
+            self._load_thumbnails_async(image_candidates, self._load_generation)
+
+    def _finish_load(self, path, push_history, status_override=None):
         self.current_path = path
         if push_history:
             self.history = self.history[: self.history_index + 1]
             self.history.append(path)
             self.history_index = len(self.history) - 1
-
         self.emit("path-changed", path)
-        self.emit("status-changed", f"{n_dirs} klasör, {n_files} dosya (Toplam {human_size(total_size)})")
+        if status_override is None:
+            self._recompute_status()
+
+    def _recompute_status(self):
+        n_dirs = n_files = 0
+        total_size = 0
+        it = self.filter_model.get_iter_first()
+        while it:
+            is_dir = self.filter_model.get_value(it, COL_IS_DIR)
+            size = self.filter_model.get_value(it, COL_SIZE)
+            if is_dir:
+                n_dirs += 1
+            else:
+                n_files += 1
+                total_size += size or 0
+            it = self.filter_model.iter_next(it)
+        if self.is_trash:
+            self.emit("status-changed", f"{n_files} öge çöp kutusunda")
+        else:
+            self.emit("status-changed", f"{n_dirs} klasör, {n_files} dosya (Toplam {human_size(total_size)})")
+
+    # -- thumbnails ------------------------------------------------------
+    def _load_thumbnails_async(self, image_paths, generation):
+        row_refs = {}
+        for row in self.store:
+            if row[COL_PATH] in image_paths:
+                row_refs[row[COL_PATH]] = Gtk.TreeRowReference.new(self.store, row.path)
+
+        def worker():
+            for path in image_paths:
+                pixbuf = icons.thumbnail_for_image(path, max_size=48)
+                if pixbuf:
+                    GLib.idle_add(self._apply_thumbnail, row_refs.get(path), pixbuf, generation)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_thumbnail(self, row_ref, pixbuf, generation):
+        if generation != self._load_generation or row_ref is None or not row_ref.valid():
+            return False
+        tree_path = row_ref.get_path()
+        if tree_path is None:
+            return False
+        it = self.store.get_iter(tree_path)
+        self.store.set_value(it, COL_PIXBUF, pixbuf)
+        return False
+
+    # -- trash -----------------------------------------------------------
+    def _load_trash(self):
+        self.store.clear()
+        self.is_trash = True
+        for item in fileops.list_trash_items():
+            pixbuf = icons.named_pixbuf("user-trash", 48) or icons.pixbuf_for_path(item["orig_path"], 48)
+            name = GLib.markup_escape_text(item["name"])
+            subtitle = human_size(item["size"]) if item["size"] else ""
+            markup = f"{name}\n<small>{GLib.markup_escape_text(subtitle)}</small>"
+            self.store.append([
+                item["name"], item["uri"], pixbuf, markup, False, item["size"] or 0, 0.0, "Çöp",
+            ])
+
+    def empty_trash(self):
+        uris = [row[COL_PATH] for row in self.store]
+        if not uris:
+            return
+        dialog = Gtk.MessageDialog(
+            transient_for=self.get_toplevel(), flags=0,
+            message_type=Gtk.MessageType.WARNING, buttons=Gtk.ButtonsType.YES_NO,
+            text=f"{len(uris)} öge kalıcı olarak silinsin mi?",
+        )
+        dialog.format_secondary_text("Bu işlem geri alınamaz.")
+        response = dialog.run()
+        dialog.destroy()
+        if response == Gtk.ResponseType.YES:
+            fileops.permanently_delete_trash_items(uris)
+            self.refresh()
+
+    def restore_selected(self):
+        uris = self.get_selected_paths()
+        if not uris:
+            return
+        operations.run_restore(self.window, uris, lambda result: self._on_restore_done(result))
+
+    def _on_restore_done(self, result):
+        if result["errors"]:
+            self._show_errors("Geri yüklenemedi", result["errors"])
+        self.refresh()
+
+    def permanently_delete_selected(self):
+        uris = self.get_selected_paths()
+        if not uris:
+            return
+        dialog = Gtk.MessageDialog(
+            transient_for=self.get_toplevel(), flags=0,
+            message_type=Gtk.MessageType.WARNING, buttons=Gtk.ButtonsType.YES_NO,
+            text=f"{len(uris)} öge kalıcı olarak silinsin mi?",
+        )
+        dialog.format_secondary_text("Bu işlem geri alınamaz.")
+        response = dialog.run()
+        dialog.destroy()
+        if response == Gtk.ResponseType.YES:
+            fileops.permanently_delete_trash_items(uris)
+            self.refresh()
 
     # -- navigation ----------------------------------------------------
     def can_go_back(self):
@@ -196,9 +311,21 @@ class FileView(Gtk.Box):
     def navigate(self, path):
         self.load_directory(path)
 
-    # -- view mode -------------------------------------------------------
+    # -- view mode / hidden files -----------------------------------------
     def set_view_mode(self, mode):
         self.stack.set_visible_child_name(mode)
+
+    def toggle_hidden_files(self):
+        self.show_hidden = not self.show_hidden
+        self.filter_model.refilter()
+        self._recompute_status()
+        return self.show_hidden
+
+    def select_all(self):
+        if self.stack.get_visible_child_name() == "grid":
+            self.icon_view.select_all()
+        else:
+            self.tree_view.get_selection().select_all()
 
     # -- selection ---------------------------------------------------------
     def get_selected_paths(self):
@@ -219,11 +346,14 @@ class FileView(Gtk.Box):
     def set_search_text(self, text):
         self._search_text = text.lower()
         self.filter_model.refilter()
+        self._recompute_status()
 
     def _filter_func(self, model, tree_iter, _data=None):
+        name = model.get_value(tree_iter, COL_NAME) or ""
+        if not self.is_trash and not self.show_hidden and name.startswith("."):
+            return False
         if not self._search_text:
             return True
-        name = model.get_value(tree_iter, COL_NAME) or ""
         return self._search_text in name.lower()
 
     # -- activation / open -------------------------------------------------
@@ -236,21 +366,54 @@ class FileView(Gtk.Box):
         self._activate_row(self.list_store_sorted, it)
 
     def _activate_row(self, model, it):
+        if self.is_trash:
+            return
         path = model.get_value(it, COL_PATH)
         is_dir = model.get_value(it, COL_IS_DIR)
         if is_dir:
             self.navigate(path)
         else:
-            fileops.open_with_default_app(path)
-            self.emit("file-opened", path)
+            self._open_path(path)
 
     def open_selected(self):
+        if self.is_trash:
+            return
         for path, is_dir in self.get_selected_infos():
             if is_dir:
                 self.navigate(path)
             else:
-                fileops.open_with_default_app(path)
-                self.emit("file-opened", path)
+                self._open_path(path)
+
+    def _open_path(self, path):
+        if fileops.is_executable_file(path):
+            self._confirm_run_executable(path)
+            return
+        fileops.open_with_default_app(path)
+        self.emit("file-opened", path)
+
+    def _confirm_run_executable(self, path):
+        name = os.path.basename(path)
+        dialog = Gtk.MessageDialog(
+            transient_for=self.get_toplevel(), flags=0,
+            message_type=Gtk.MessageType.QUESTION,
+            text=f'"{name}" çalıştırılabilir bir dosya',
+        )
+        dialog.format_secondary_text("Ne yapmak istersiniz?")
+        dialog.add_buttons(
+            "İptal", Gtk.ResponseType.CANCEL,
+            "Görüntüle/Düzenle", 1,
+            "Terminalde Çalıştır", 2,
+            "Çalıştır", 3,
+        )
+        response = dialog.run()
+        dialog.destroy()
+        if response == 1:
+            fileops.open_with_default_app(path)
+            self.emit("file-opened", path)
+        elif response == 2:
+            self.emit("open-terminal-request", path)
+        elif response == 3:
+            fileops.run_executable(path)
 
     # -- context menu --------------------------------------------------
     def _on_button_press(self, widget, event):
@@ -273,6 +436,10 @@ class FileView(Gtk.Box):
         return True
 
     def _show_context_menu(self, event):
+        if self.is_trash:
+            self._show_trash_context_menu(event)
+            return
+
         selected = self.get_selected_infos()
         menu = Gtk.Menu()
 
@@ -288,10 +455,13 @@ class FileView(Gtk.Box):
                 item("Terminal ile Aç").connect(
                     "activate", lambda _m: self.emit("open-terminal-request", selected[0][0])
                 )
+            if len(selected) == 1 and not selected[0][1] and fileops.is_archive(selected[0][0]):
+                item("Buraya Çıkart").connect("activate", lambda _m: self.extract_selected())
             menu.append(Gtk.SeparatorMenuItem())
             item("Kopyala").connect("activate", lambda _m: self.copy_selected())
             item("Kes").connect("activate", lambda _m: self.cut_selected())
-        item("Yapıştır", sensitive=self.clipboard_state.has_content).connect(
+            item("Sıkıştır (zip)").connect("activate", lambda _m: self.compress_selected())
+        item("Yapıştır", sensitive=clipboard.has_content()).connect(
             "activate", lambda _m: self.paste()
         )
         menu.append(Gtk.SeparatorMenuItem())
@@ -302,11 +472,43 @@ class FileView(Gtk.Box):
             item("Sil").connect("activate", lambda _m: self.delete_selected())
             menu.append(Gtk.SeparatorMenuItem())
             item("Özellikler").connect("activate", lambda _m: self.emit("selection-changed"))
+        item("Gizli Dosyaları Göster" if not self.show_hidden else "Gizli Dosyaları Gizle").connect(
+            "activate", lambda _m: self.toggle_hidden_files()
+        )
         item("Terminal Aç Burada").connect(
             "activate", lambda _m: self.emit("open-terminal-request", self.current_path)
         )
         menu.show_all()
         menu.popup_at_pointer(event)
+
+    def _show_trash_context_menu(self, event):
+        selected = self.get_selected_paths()
+        menu = Gtk.Menu()
+
+        def item(label, sensitive=True):
+            mi = Gtk.MenuItem(label=label)
+            mi.set_sensitive(sensitive)
+            menu.append(mi)
+            return mi
+
+        item("Geri Yükle", sensitive=bool(selected)).connect("activate", lambda _m: self.restore_selected())
+        item("Kalıcı Olarak Sil", sensitive=bool(selected)).connect(
+            "activate", lambda _m: self.permanently_delete_selected()
+        )
+        menu.append(Gtk.SeparatorMenuItem())
+        item("Çöp Kutusunu Boşalt").connect("activate", lambda _m: self.empty_trash())
+        menu.show_all()
+        menu.popup_at_pointer(event)
+
+    def _show_errors(self, title, errors):
+        dialog = Gtk.MessageDialog(
+            transient_for=self.get_toplevel(), flags=0,
+            message_type=Gtk.MessageType.ERROR, buttons=Gtk.ButtonsType.OK,
+            text=title,
+        )
+        dialog.format_secondary_text("\n".join(errors[:10]))
+        dialog.run()
+        dialog.destroy()
 
     # -- operations ----------------------------------------------------
     def new_folder(self):
@@ -314,30 +516,92 @@ class FileView(Gtk.Box):
         self.refresh()
         self.select_by_path(path)
 
+        def undo_fn():
+            fileops.trash_paths([path])
+            self.refresh()
+
+        def redo_fn():
+            try:
+                os.makedirs(path)
+            except OSError:
+                fileops.create_folder(self.current_path)
+            self.refresh()
+
+        self.window.push_undo(f'"{os.path.basename(path)}" klasörü oluşturuldu', undo_fn, redo_fn)
+
     def new_file(self):
         path = fileops.create_file(self.current_path)
         self.refresh()
         self.select_by_path(path)
 
+        def undo_fn():
+            fileops.trash_paths([path])
+            self.refresh()
+
+        def redo_fn():
+            try:
+                with open(path, "a", encoding="utf-8"):
+                    pass
+            except OSError:
+                fileops.create_file(self.current_path)
+            self.refresh()
+
+        self.window.push_undo(f'"{os.path.basename(path)}" dosyası oluşturuldu', undo_fn, redo_fn)
+
     def copy_selected(self):
         paths = self.get_selected_paths()
         if paths:
-            self.clipboard_state.set(paths, is_cut=False)
+            clipboard.copy(paths)
 
     def cut_selected(self):
         paths = self.get_selected_paths()
         if paths:
-            self.clipboard_state.set(paths, is_cut=True)
+            clipboard.cut(paths)
 
     def paste(self):
-        if not self.clipboard_state.has_content:
+        clipboard.request_paste(self._on_clipboard_data)
+
+    def _on_clipboard_data(self, paths, is_cut):
+        if not paths:
             return
-        if self.clipboard_state.is_cut:
-            fileops.move_paths(self.clipboard_state.paths, self.current_path)
-            self.clipboard_state.clear()
+        dest_dir = self.current_path
+        if is_cut:
+            def on_move_done(result):
+                if result["errors"]:
+                    self._show_errors("Taşınamadı", result["errors"])
+                moved = result["moved"]
+                if moved:
+                    self._push_move_undo(moved)
+                self.refresh()
+
+            operations.run_move(self.window, paths, dest_dir, on_move_done)
         else:
-            fileops.copy_paths(self.clipboard_state.paths, self.current_path)
-        self.refresh()
+            def on_copy_done(result):
+                if result["errors"]:
+                    self._show_errors("Kopyalanamadı", result["errors"])
+                created = result["created"]
+                if created:
+                    def undo_fn():
+                        operations.run_trash(self.window, created, lambda _r: self.refresh())
+
+                    def redo_fn():
+                        operations.run_copy(self.window, paths, dest_dir, lambda _r: self.refresh())
+
+                    self.window.push_undo(f"{len(created)} öge kopyalandı", undo_fn, redo_fn)
+                self.refresh()
+
+            operations.run_copy(self.window, paths, dest_dir, on_copy_done)
+
+    def _push_move_undo(self, moved):
+        def undo_fn():
+            pairs = [(new_p, old_p) for new_p, old_p in moved]
+            operations.run_move_pairs(self.window, pairs, "Geri alınıyor...", lambda _r: self.refresh())
+
+        def redo_fn():
+            pairs = [(old_p, new_p) for new_p, old_p in moved]
+            operations.run_move_pairs(self.window, pairs, "Yeniden yapılıyor...", lambda _r: self.refresh())
+
+        self.window.push_undo(f"{len(moved)} öge taşındı", undo_fn, redo_fn)
 
     def delete_selected(self):
         paths = self.get_selected_paths()
@@ -352,9 +616,26 @@ class FileView(Gtk.Box):
         )
         response = dialog.run()
         dialog.destroy()
-        if response == Gtk.ResponseType.YES:
-            fileops.trash_paths(paths)
+        if response != Gtk.ResponseType.YES:
+            return
+
+        def on_trash_done(result):
+            if result["errors"]:
+                self._show_errors("Silinemedi", result["errors"])
+            trashed = result["trashed"]
+            if trashed:
+                def undo_fn():
+                    uris = [u for _p, u in trashed if u]
+                    operations.run_restore(self.window, uris, lambda _r: self.refresh())
+
+                def redo_fn():
+                    paths2 = [p for p, _u in trashed]
+                    operations.run_trash(self.window, paths2, lambda _r: self.refresh())
+
+                self.window.push_undo(f"{len(trashed)} öge çöpe taşındı", undo_fn, redo_fn)
             self.refresh()
+
+        operations.run_trash(self.window, paths, on_trash_done)
 
     def rename_selected(self):
         paths = self.get_selected_paths()
@@ -381,11 +662,63 @@ class FileView(Gtk.Box):
             new_name = entry.get_text().strip()
             if new_name and new_name != old_name:
                 try:
-                    fileops.rename_path(old_path, new_name)
+                    new_path = fileops.rename_path(old_path, new_name)
                 except OSError as exc:
                     self.emit("status-changed", f"Yeniden adlandırılamadı: {exc}")
-                self.refresh()
+                    new_path = None
+                if new_path:
+                    def undo_fn(np=new_path, on=old_name):
+                        try:
+                            fileops.rename_path(np, on)
+                        except OSError:
+                            pass
+                        self.refresh()
+
+                    def redo_fn(op=old_path, nn=new_name):
+                        try:
+                            fileops.rename_path(op, nn)
+                        except OSError:
+                            pass
+                        self.refresh()
+
+                    self.window.push_undo(f'"{old_name}" yeniden adlandırıldı', undo_fn, redo_fn)
+            self.refresh()
         dialog.destroy()
+
+    def extract_selected(self):
+        paths = self.get_selected_paths()
+        archives = [p for p in paths if fileops.is_archive(p)]
+        if not archives:
+            return
+        dest_dir = self.current_path
+
+        def work():
+            for archive_path in archives:
+                fileops.extract_archive(archive_path, dest_dir)
+
+        def on_done(result):
+            if result["error"]:
+                self._show_errors("Arşiv çıkartılamadı", [result["error"]])
+            self.refresh()
+
+        operations.run_background(self.window, "Çıkartılıyor...", work, on_done)
+
+    def compress_selected(self):
+        paths = self.get_selected_paths()
+        if not paths:
+            return
+        base_name = os.path.basename(paths[0].rstrip("/")) if len(paths) == 1 else "Arşiv"
+        dest_zip = fileops.unique_destination(self.current_path, f"{base_name}.zip")
+
+        def work():
+            fileops.create_zip(paths, dest_zip)
+
+        def on_done(result):
+            if result["error"]:
+                self._show_errors("Sıkıştırılamadı", [result["error"]])
+            self.refresh()
+
+        operations.run_background(self.window, "Sıkıştırılıyor...", work, on_done)
 
     def select_by_path(self, path):
         for row in self.store:
@@ -411,10 +744,12 @@ class FileView(Gtk.Box):
             widget.connect("drag-data-received", self._on_drag_data_received)
 
     def _on_drag_data_get(self, _widget, _ctx, data, _info, _time):
-        uris = [GLib.filename_to_uri(p) for p in self.get_selected_paths()]
+        uris = [GLib.filename_to_uri(p) for p in self.get_selected_paths() if not self.is_trash]
         data.set_uris(uris)
 
     def _on_drag_data_received(self, _widget, _ctx, _x, _y, data, _info, _time):
+        if self.is_trash:
+            return
         uris = data.get_uris()
         paths = []
         for uri in uris:
@@ -424,5 +759,4 @@ class FileView(Gtk.Box):
             except GLib.Error:
                 continue
         if paths:
-            fileops.copy_paths(paths, self.current_path)
-            self.refresh()
+            self._on_clipboard_data(paths, is_cut=False)

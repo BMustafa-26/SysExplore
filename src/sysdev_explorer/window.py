@@ -4,14 +4,15 @@ import os
 import gi
 
 gi.require_version("Gtk", "3.0")
-from gi.repository import Gdk, Gio, GLib, Gtk  # noqa: E402
+from gi.repository import Gdk, GLib, Gtk  # noqa: E402
 
 from sysdev_explorer.bottom_panel import QuickActionsPanel, RecentPanel, TerminalPanel
 from sysdev_explorer.disk_utils import human_size
-from sysdev_explorer.fileops import ClipboardState, open_terminal_here
 from sysdev_explorer.file_view import FileView
+from sysdev_explorer.preferences import Preferences
 from sysdev_explorer.side_panel import SidePanel
 from sysdev_explorer.sidebar import Sidebar
+from sysdev_explorer.undo_manager import UndoManager
 
 HOME = os.path.expanduser("~")
 
@@ -22,7 +23,7 @@ class TabPage(Gtk.Box):
     def __init__(self, window, start_path):
         super().__init__(orientation=Gtk.Orientation.VERTICAL)
         self.window = window
-        self.file_view = FileView(window.clipboard_state, start_path)
+        self.file_view = FileView(window, start_path)
 
         self.pack_start(self._build_toolbar(), False, False, 0)
         self.pack_start(self.file_view, True, True, 0)
@@ -57,22 +58,45 @@ class TabPage(Gtk.Box):
         for b in (self.back_btn, self.forward_btn, self.up_btn, self.home_btn):
             bar.pack_start(b, False, False, 0)
 
+        self.empty_trash_btn = Gtk.Button(label="Boşalt")
+        self.empty_trash_btn.connect("clicked", lambda _b: self.file_view.empty_trash())
+        self.empty_trash_btn.set_no_show_all(True)
+        self.empty_trash_btn.hide()
+        bar.pack_start(self.empty_trash_btn, False, False, 0)
+
+        self.nav_stack = Gtk.Stack()
+        bar.pack_start(self.nav_stack, True, True, 0)
+
         crumb_scroller = Gtk.ScrolledWindow()
         crumb_scroller.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.NEVER)
         self.breadcrumb_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2)
         crumb_scroller.add(self.breadcrumb_box)
-        bar.pack_start(crumb_scroller, True, True, 0)
+        self.nav_stack.add_named(crumb_scroller, "breadcrumb")
+
+        self.address_entry = Gtk.Entry()
+        self.address_entry.connect("activate", self._on_address_activate)
+        self.address_entry.connect("key-press-event", self._on_address_key_press)
+        self.nav_stack.add_named(self.address_entry, "address")
+        self.nav_stack.set_visible_child_name("breadcrumb")
 
         self.search_entry = Gtk.SearchEntry(placeholder_text="Ara (Ctrl+F)")
         self.search_entry.set_width_chars(22)
         self.search_entry.connect("search-changed", self._on_search_changed)
         bar.pack_start(self.search_entry, False, False, 0)
 
+        self.hidden_btn = Gtk.ToggleButton()
+        self.hidden_btn.set_image(Gtk.Image.new_from_icon_name("view-conceal-symbolic", Gtk.IconSize.MENU))
+        self.hidden_btn.set_tooltip_text("Gizli dosyaları göster (Ctrl+H)")
+        self.hidden_btn.set_active(self.file_view.show_hidden)
+        self.hidden_btn.connect("toggled", self._on_hidden_toggle)
+        bar.pack_start(self.hidden_btn, False, False, 0)
+
         grid_btn = Gtk.ToggleButton()
         grid_btn.set_image(Gtk.Image.new_from_icon_name("view-grid-symbolic", Gtk.IconSize.MENU))
-        grid_btn.set_active(True)
+        grid_btn.set_active(self.file_view.stack.get_visible_child_name() == "grid")
         list_btn = Gtk.ToggleButton()
         list_btn.set_image(Gtk.Image.new_from_icon_name("view-list-symbolic", Gtk.IconSize.MENU))
+        list_btn.set_active(self.file_view.stack.get_visible_child_name() == "list")
         grid_btn.connect("toggled", self._on_view_toggle, "grid", list_btn)
         list_btn.connect("toggled", self._on_view_toggle, "list", grid_btn)
         bar.pack_start(grid_btn, False, False, 0)
@@ -98,14 +122,46 @@ class TabPage(Gtk.Box):
         if toggle_btn.get_active():
             other_btn.set_active(False)
             self.file_view.set_view_mode(mode)
+            self.window.preferences.set("view_mode", mode)
         elif not other_btn.get_active():
             toggle_btn.set_active(True)
+
+    def _on_hidden_toggle(self, toggle_btn):
+        if toggle_btn.get_active() != self.file_view.show_hidden:
+            self.file_view.toggle_hidden_files()
+
+    def sync_hidden_button(self):
+        self.hidden_btn.set_active(self.file_view.show_hidden)
 
     def _on_search_changed(self, entry):
         self.file_view.set_search_text(entry.get_text())
 
+    def enter_address_mode(self):
+        if self.file_view.is_trash or self.file_view.current_path.startswith("network://"):
+            return
+        self.address_entry.set_text(self.file_view.current_path)
+        self.nav_stack.set_visible_child_name("address")
+        self.address_entry.grab_focus()
+        self.address_entry.select_region(0, -1)
+
+    def exit_address_mode(self):
+        self.nav_stack.set_visible_child_name("breadcrumb")
+
+    def _on_address_activate(self, entry):
+        path = os.path.expanduser(entry.get_text().strip())
+        if path:
+            self.file_view.navigate(path)
+        self.exit_address_mode()
+
+    def _on_address_key_press(self, _entry, event):
+        if event.keyval == Gdk.KEY_Escape:
+            self.exit_address_mode()
+            return True
+        return False
+
     def _on_path_changed(self, _view, path):
         self._update_breadcrumb(path)
+        self.empty_trash_btn.set_visible(self.file_view.is_trash)
         self.window.on_tab_path_changed(self, path)
 
     def _on_status_changed(self, _view, text):
@@ -131,8 +187,14 @@ class TabPage(Gtk.Box):
         self.back_btn.set_sensitive(self.file_view.can_go_back())
         self.forward_btn.set_sensitive(self.file_view.can_go_forward())
 
-        if path.startswith(("trash://", "network://")):
-            btn = Gtk.Button(label=path)
+        if path == "trash:///":
+            btn = Gtk.Button(label="🗑 Çöp Kutusu")
+            btn.set_sensitive(False)
+            self.breadcrumb_box.add(btn)
+            self.breadcrumb_box.show_all()
+            return
+        if path.startswith("network://"):
+            btn = Gtk.Button(label="🌐 Ağ Konumları")
             btn.set_sensitive(False)
             self.breadcrumb_box.add(btn)
             self.breadcrumb_box.show_all()
@@ -157,6 +219,8 @@ class TabPage(Gtk.Box):
 
     @property
     def title(self):
+        if self.file_view.is_trash:
+            return "Çöp Kutusu"
         return os.path.basename(self.file_view.current_path.rstrip("/")) or "/"
 
 
@@ -164,7 +228,8 @@ class MainWindow(Gtk.ApplicationWindow):
     def __init__(self, application):
         super().__init__(application=application, title="SysDev Explorer")
         self.set_default_size(1400, 900)
-        self.clipboard_state = ClipboardState()
+        self.preferences = Preferences()
+        self.undo_manager = UndoManager()
         self._tabs = []
 
         self._build_headerbar()
@@ -227,7 +292,45 @@ class MainWindow(Gtk.ApplicationWindow):
         title_label.set_use_markup(True)
         title_box.pack_start(title_label, False, False, 0)
         header.set_custom_title(title_box)
+
+        menu_btn = Gtk.MenuButton()
+        menu_btn.set_image(Gtk.Image.new_from_icon_name("open-menu-symbolic", Gtk.IconSize.MENU))
+        popover = Gtk.Popover()
+        menu_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        menu_box.set_border_width(6)
+
+        def add_menu_item(label, callback):
+            btn = Gtk.ModelButton(label=label)
+            btn.get_child().set_xalign(0)
+            btn.connect("clicked", callback)
+            menu_box.pack_start(btn, False, False, 0)
+
+        add_menu_item("Geri Al\tCtrl+Z", lambda _b: self.perform_undo())
+        add_menu_item("Yinele\tCtrl+Shift+Z", lambda _b: self.perform_redo())
+        menu_box.pack_start(Gtk.Separator(), False, False, 4)
+        add_menu_item("Tercihler...", lambda _b: self.show_preferences())
+        add_menu_item("Hakkında...", lambda _b: self.show_about())
+        menu_box.show_all()
+        popover.add(menu_box)
+        menu_btn.set_popover(popover)
+        header.pack_end(menu_btn)
+
         self.set_titlebar(header)
+
+    def show_preferences(self):
+        from sysdev_explorer.prefs_dialog import PreferencesDialog
+        dialog = PreferencesDialog(self, self.preferences)
+        dialog.run()
+        dialog.destroy()
+
+    def show_about(self):
+        dialog = Gtk.AboutDialog(transient_for=self, modal=True)
+        dialog.set_program_name("SysDev Explorer")
+        dialog.set_version("1.0.0")
+        dialog.set_comments("Git durumu, terminal ve hızlı işlemleri bir arada sunan Linux dosya yöneticisi")
+        dialog.set_logo_icon_name("system-file-manager")
+        dialog.run()
+        dialog.destroy()
 
     # -- tabs ----------------------------------------------------------
     def open_tab(self, path, title=None):
@@ -283,7 +386,9 @@ class MainWindow(Gtk.ApplicationWindow):
         if tab is not self._active_tab():
             return
         selected = tab.file_view.get_selected_paths()
-        if selected:
+        if len(selected) > 1:
+            self.side_panel.update_multi_selection(selected)
+        elif selected:
             self.side_panel.update_selection(selected[-1])
         else:
             self.side_panel.update_selection(tab.file_view.current_path)
@@ -303,6 +408,15 @@ class MainWindow(Gtk.ApplicationWindow):
 
     def open_terminal_at(self, path):
         self.terminal_panel.open_tab(path)
+
+    def push_undo(self, label, undo_fn, redo_fn):
+        self.undo_manager.push(label, undo_fn, redo_fn)
+
+    def perform_undo(self):
+        self.undo_manager.undo()
+
+    def perform_redo(self):
+        self.undo_manager.redo()
 
     # -- quick actions / shortcuts ------------------------------------------
     def _build_actions(self):
@@ -343,6 +457,7 @@ class MainWindow(Gtk.ApplicationWindow):
         fv = tab.file_view
         keyval = event.keyval
         ctrl = bool(event.state & Gdk.ModifierType.CONTROL_MASK)
+        shift = bool(event.state & Gdk.ModifierType.SHIFT_MASK)
         alt = bool(event.state & Gdk.ModifierType.MOD1_MASK)
 
         if keyval == Gdk.KEY_F2:
@@ -363,6 +478,17 @@ class MainWindow(Gtk.ApplicationWindow):
             self.open_terminal_at(fv.current_path)
         elif ctrl and keyval in (Gdk.KEY_f, Gdk.KEY_F):
             tab.search_entry.grab_focus()
+        elif ctrl and keyval in (Gdk.KEY_l, Gdk.KEY_L):
+            tab.enter_address_mode()
+        elif ctrl and keyval in (Gdk.KEY_h, Gdk.KEY_H):
+            fv.toggle_hidden_files()
+            tab.sync_hidden_button()
+        elif ctrl and keyval in (Gdk.KEY_a, Gdk.KEY_A):
+            fv.select_all()
+        elif ctrl and shift and keyval in (Gdk.KEY_z, Gdk.KEY_Z):
+            self.perform_redo()
+        elif ctrl and keyval in (Gdk.KEY_z, Gdk.KEY_Z):
+            self.perform_undo()
         elif alt and keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
             selected = fv.get_selected_paths() or [fv.current_path]
             self.side_panel.update_selection(selected[0])

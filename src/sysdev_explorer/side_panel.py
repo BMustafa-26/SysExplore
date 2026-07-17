@@ -2,11 +2,12 @@
 import grp
 import os
 import pwd
+import threading
 
 import gi
 
 gi.require_version("Gtk", "3.0")
-from gi.repository import Gdk, GdkPixbuf, Gtk  # noqa: E402
+from gi.repository import Gdk, GdkPixbuf, GLib, Gtk  # noqa: E402
 
 from sysdev_explorer import fileops, git_utils, icons
 from sysdev_explorer.disk_utils import human_size
@@ -53,8 +54,10 @@ class SidePanel(Gtk.Box):
         outer.pack_start(self.notebook, True, True, 0)
 
         self.notebook.append_page(self._build_general_tab(), Gtk.Label(label="Genel"))
-        self.notebook.append_page(self._build_permissions_tab(), Gtk.Label(label="İzinler"))
-        self.notebook.append_page(self._build_sharing_tab(), Gtk.Label(label="Paylaşım"))
+        self.perm_page = self._build_permissions_tab()
+        self.notebook.append_page(self.perm_page, Gtk.Label(label="İzinler"))
+        self.sharing_page = self._build_sharing_tab()
+        self.notebook.append_page(self.sharing_page, Gtk.Label(label="Paylaşım"))
 
         frame.add(outer)
         self.pack_start(frame, False, False, 0)
@@ -183,7 +186,51 @@ class SidePanel(Gtk.Box):
         self.pack_start(frame, True, True, 0)
 
     # -- public API ----------------------------------------------------
+    def update_multi_selection(self, paths):
+        self._current_path = None
+        self.perm_page.set_sensitive(False)
+        self.sharing_page.set_sensitive(False)
+        self.title_label.set_markup(f"<b>{len(paths)} öge seçildi</b>")
+        self.icon_image.set_from_pixbuf(icons.named_pixbuf("edit-copy", 64) or icons.pixbuf_for_path(paths[0], 64))
+
+        n_dirs = sum(1 for p in paths if os.path.isdir(p))
+        n_files = len(paths) - n_dirs
+        for key in self.general_labels:
+            self.general_labels[key].set_text("-")
+        self.general_labels["Tür"].set_text(f"{n_dirs} klasör, {n_files} dosya")
+        self.general_labels["Konum"].set_text(os.path.dirname(paths[0]) or "/")
+        self.general_labels["İçerik"].set_text(f"{len(paths)} öge seçili")
+        self.general_labels["Boyut"].set_text("Hesaplanıyor...")
+
+        self.git_frame.set_visible(False)
+        self.preview_frame.set_visible(False)
+
+        def worker():
+            total = 0
+            for p in paths:
+                try:
+                    if os.path.isdir(p) and not os.path.islink(p):
+                        for root, _dirs, files in os.walk(p, onerror=lambda e: None):
+                            for f in files:
+                                try:
+                                    total += os.lstat(os.path.join(root, f)).st_size
+                                except OSError:
+                                    pass
+                    else:
+                        total += os.lstat(p).st_size
+                except OSError:
+                    pass
+            GLib.idle_add(self._on_multi_summary_ready, total)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_multi_summary_ready(self, total_size):
+        self.general_labels["Boyut"].set_text(human_size(total_size))
+        return False
+
     def update_selection(self, path):
+        self.perm_page.set_sensitive(True)
+        self.sharing_page.set_sensitive(True)
         self._current_path = path
         self._updating_perms = True
         if not path or not os.path.exists(path):

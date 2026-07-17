@@ -11,6 +11,10 @@ APP_ID = "com.sysdev.explorer"
 
 
 def _load_css():
+    from sysdev_explorer.preferences import Preferences
+    if Preferences().get("theme") == "system":
+        return
+
     css_path = os.environ.get("SYSDEV_EXPLORER_CSS")
     if not css_path:
         # app.py lives in <project_root>/src/sysdev_explorer/app.py
