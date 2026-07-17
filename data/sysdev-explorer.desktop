@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=SysDev Explorer
+GenericName=Dosya Yöneticisi
+Comment=Git durumu, terminal ve hızlı işlemleri bir arada sunan dosya yöneticisi
+Exec=sysdev-explorer %U
+Icon=sysdev-explorer
+Terminal=false
+Categories=System;Utility;FileTools;FileManager;
+Keywords=file;manager;explorer;dosya;yonetici;
+StartupNotify=true
+MimeType=inode/directory;

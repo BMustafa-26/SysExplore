@@ -1,0 +1,114 @@
+/* SysDev Explorer - dark theme, purple accent (matches the reference design) */
+
+@define-color sysdev_bg #14141c;
+@define-color sysdev_bg_alt #1b1b26;
+@define-color sysdev_panel #1e1e2a;
+@define-color sysdev_border #2b2b3a;
+@define-color sysdev_accent #7c6ff0;
+@define-color sysdev_accent_hover #8f83f5;
+@define-color sysdev_text #e4e4ee;
+@define-color sysdev_text_dim #8b8ba0;
+
+window, .background {
+    background-color: @sysdev_bg;
+    color: @sysdev_text;
+}
+
+headerbar {
+    background-color: @sysdev_bg_alt;
+    border-bottom: 1px solid @sysdev_border;
+    color: @sysdev_text;
+}
+
+.sidebar {
+    background-color: @sysdev_bg_alt;
+    border-right: 1px solid @sysdev_border;
+}
+
+.sidebar-header-label {
+    color: @sysdev_text_dim;
+    font-size: 11px;
+    font-weight: bold;
+    letter-spacing: 0.04em;
+    margin-top: 6px;
+}
+
+.sidebar-row:selected, list row:selected {
+    background-color: alpha(@sysdev_accent, 0.28);
+    color: @sysdev_text;
+}
+
+.sidebar-row:hover {
+    background-color: alpha(@sysdev_accent, 0.12);
+}
+
+.disk-bar trough {
+    min-height: 6px;
+    border-radius: 4px;
+    background-color: @sysdev_border;
+}
+
+.disk-bar block.filled {
+    background-color: @sysdev_accent;
+    border-radius: 4px;
+}
+
+.nav-toolbar {
+    background-color: @sysdev_bg_alt;
+    border-bottom: 1px solid @sysdev_border;
+}
+
+.breadcrumb-btn {
+    color: @sysdev_text_dim;
+    font-weight: 600;
+}
+
+.breadcrumb-btn:last-child {
+    color: @sysdev_text;
+}
+
+.file-grid, .file-list {
+    background-color: @sysdev_bg;
+    color: @sysdev_text;
+}
+
+.panel-frame {
+    background-color: @sysdev_panel;
+    border: 1px solid @sysdev_border;
+    border-radius: 10px;
+}
+
+.panel-title {
+    font-weight: bold;
+    font-size: 13px;
+    color: @sysdev_text;
+}
+
+.quick-action-btn {
+    background-color: @sysdev_bg_alt;
+    border: 1px solid @sysdev_border;
+    border-radius: 8px;
+    padding: 6px;
+}
+
+.quick-action-btn:hover {
+    background-color: alpha(@sysdev_accent, 0.18);
+    border-color: @sysdev_accent;
+}
+
+.dim-label {
+    color: @sysdev_text_dim;
+}
+
+.side-panel {
+    background-color: @sysdev_bg;
+}
+
+scrollbar slider {
+    background-color: @sysdev_border;
+    border-radius: 6px;
+}
+
+scrollbar slider:hover {
+    background-color: @sysdev_accent;
+}
